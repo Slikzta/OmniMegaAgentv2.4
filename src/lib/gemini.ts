@@ -117,6 +117,10 @@ export async function testGeminiLiveWebSocket(params: {
         const setupMessage = {
           setup: {
             model: formattedModel,
+            generationConfig: {
+              responseModalities: ["AUDIO"],
+            },
+            outputAudioTranscription: {},
           },
         };
         try {
@@ -220,6 +224,8 @@ export async function streamGeminiLiveWebSocket(params: {
   liveWsUrl?: string;
   callbacks: {
     onChunk: (text: string) => void;
+    onAudio?: (base64Audio: string) => void;
+    onInterrupted?: () => void;
     onMetadata?: (meta: any) => void;
     onDone: () => void;
     onError: (err: Error) => void;
@@ -270,8 +276,9 @@ export async function streamGeminiLiveWebSocket(params: {
         setup: {
           model: formattedModel,
           generationConfig: {
-            responseModalities: ["TEXT"],
+            responseModalities: ["AUDIO"],
           },
+          outputAudioTranscription: {},
         },
       };
       if (params.systemInstruction) {
@@ -333,12 +340,24 @@ export async function streamGeminiLiveWebSocket(params: {
         }
 
         if (parsed.serverContent) {
+          if (parsed.serverContent.interrupted && params.callbacks.onInterrupted) {
+            params.callbacks.onInterrupted();
+          }
+
+          if (parsed.serverContent.outputTranscription?.text) {
+            receivedAnyText = true;
+            params.callbacks.onChunk(parsed.serverContent.outputTranscription.text);
+          }
+
           const parts = parsed.serverContent.modelTurn?.parts;
           if (Array.isArray(parts)) {
             for (const part of parts) {
               if (part?.text) {
                 receivedAnyText = true;
                 params.callbacks.onChunk(part.text);
+              }
+              if (part?.inlineData?.data && params.callbacks.onAudio) {
+                params.callbacks.onAudio(part.inlineData.data);
               }
             }
           }
@@ -367,12 +386,17 @@ export async function streamGeminiLiveWebSocket(params: {
     };
 
     ws.onclose = (event: any) => {
+      console.warn(`[streamGeminiLiveWebSocket] Closed (code ${event.code}: ${event.reason || 'connection closed'})`);
       if (!isDone) {
         isDone = true;
         if (receivedAnyText) {
           params.callbacks.onDone();
         } else if (event.code !== 1000) {
-          params.callbacks.onError(new Error(`Gemini Live WebSocket closed (code ${event.code}: ${event.reason || 'connection closed'}).`));
+          let errorMsg = `Gemini Live WebSocket closed (code ${event.code}: ${event.reason || 'connection closed'}).`;
+          if (event.code === 1007) {
+            errorMsg = `Gemini Live rejected configuration (code 1007: ${event.reason || 'unsupported modality'}). Live models require AUDIO response modalities.`;
+          }
+          params.callbacks.onError(new Error(errorMsg));
         } else {
           params.callbacks.onDone();
         }

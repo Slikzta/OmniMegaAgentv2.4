@@ -18,7 +18,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { cn } from '../lib/utils';
 import { toast } from 'sonner';
 import { SIERRA_CORE_PERSONA } from '../lib/persona';
-import { streamChat } from '../lib/providers';
+import { streamChat, getNativeStoredKeys } from '../lib/providers';
 
 interface TranscriptItem {
   id: string;
@@ -198,6 +198,12 @@ export default function LiveVoice() {
   };
 
   const sessionRef = useRef<any>(null);
+  const liveWsRef = useRef<any>(null);
+  const liveWsReadyRef = useRef<boolean>(false);
+  const liveWsConnectPromiseRef = useRef<Promise<any> | null>(null);
+  const liveWsAudioReceivedRef = useRef<boolean>(false);
+  const liveWsTextAccumulatedRef = useRef<string>('');
+  const liveWsCurrentSierraIdRef = useRef<string | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const playbackContextRef = useRef<AudioContext | null>(null);
   const nextPlayTimeRef = useRef<number>(0);
@@ -677,6 +683,257 @@ export default function LiveVoice() {
     }
   };
 
+  const ensureLiveWebSocket = async (model: string): Promise<any> => {
+    // Reuse single open WebSocket connection across utterances
+    if (liveWsRef.current && (liveWsRef.current.readyState === 1 || liveWsRef.current.readyState === (WebSocket as any)?.OPEN)) {
+      if (liveWsReadyRef.current) {
+        return liveWsRef.current;
+      }
+      if (liveWsConnectPromiseRef.current) {
+        return await liveWsConnectPromiseRef.current;
+      }
+    }
+
+    if (liveWsConnectPromiseRef.current) {
+      return await liveWsConnectPromiseRef.current;
+    }
+
+    const connectPromise = new Promise<any>((resolve, reject) => {
+      try {
+        const keys = getNativeStoredKeys();
+        const apiKey = keys.gemini || (typeof process !== 'undefined' ? process.env?.GEMINI_API_KEY : '') || '';
+        if (!apiKey) {
+          throw new Error("Gemini API key is required for Live Voice. Please configure your key in Settings.");
+        }
+
+        const baseEndpoint = (liveWsEndpoint && liveWsEndpoint.trim())
+          ? liveWsEndpoint.trim()
+          : (typeof localStorage !== 'undefined' ? localStorage.getItem('sierra_live_voice_endpoint') || DEFAULT_LIVE_WEBSOCKET_URL : DEFAULT_LIVE_WEBSOCKET_URL);
+
+        let wsUrl = baseEndpoint;
+        if (!wsUrl.includes('key=')) {
+          const sep = wsUrl.includes('?') ? '&' : '?';
+          wsUrl = `${wsUrl}${sep}key=${encodeURIComponent(apiKey)}`;
+        }
+
+        const targetModel = model || 'gemini-3.8-live';
+        const formattedModel = targetModel.startsWith('models/') ? targetModel : `models/${targetModel}`;
+
+        const WebSocketClass = typeof WebSocket !== 'undefined' ? WebSocket : (globalThis as any).WebSocket;
+        if (!WebSocketClass) {
+          throw new Error("WebSocket API is not supported in this environment");
+        }
+
+        addDebugLog('LiveWS:Connect', `Connecting to Gemini Live WebSocket: ${baseEndpoint} (model: ${formattedModel})`);
+        console.log(`[LiveWS:Connect] Connecting to ${baseEndpoint} with model ${formattedModel}`);
+
+        const ws = new WebSocketClass(wsUrl);
+        liveWsRef.current = ws;
+        liveWsReadyRef.current = false;
+
+        let setupResolved = false;
+
+        ws.onopen = () => {
+          addDebugLog('LiveWS:Open', 'WebSocket connection established. Sending setup with responseModalities: ["AUDIO"]');
+          console.log("[LiveWS:Open] WebSocket connected, sending setup with responseModalities: ['AUDIO']");
+          const setupMessage = {
+            setup: {
+              model: formattedModel,
+              generationConfig: {
+                responseModalities: ["AUDIO"],
+              },
+              outputAudioTranscription: {},
+              systemInstruction: {
+                parts: [{
+                  text: `${SIERRA_CORE_PERSONA}\n\nYou are Sierra in Continuous Voice Chat. Speak warmly, directly, and concisely (1-2 short natural sentences). Do not use markdown, bullet points, asterisks, or formatting because your response is being spoken aloud.`
+                }],
+              },
+            },
+          };
+          try {
+            ws.send(JSON.stringify(setupMessage));
+          } catch (sendErr: any) {
+            console.error("[LiveWS:Setup] Failed to send setup:", sendErr);
+            if (!setupResolved) {
+              setupResolved = true;
+              liveWsConnectPromiseRef.current = null;
+              reject(sendErr);
+            }
+          }
+        };
+
+        ws.onmessage = async (event: any) => {
+          let dataStr = '';
+          try {
+            if (typeof event.data === 'string') {
+              dataStr = event.data;
+            } else if (event.data instanceof Blob) {
+              dataStr = await event.data.text();
+            } else if (event.data instanceof ArrayBuffer) {
+              dataStr = new TextDecoder().decode(event.data);
+            } else if (typeof Buffer !== 'undefined' && Buffer.isBuffer(event.data)) {
+              dataStr = event.data.toString('utf-8');
+            } else if (event.data && typeof event.data.toString === 'function') {
+              dataStr = event.data.toString();
+            }
+
+            const parsed = JSON.parse(dataStr);
+
+            if (parsed.setupComplete !== undefined) {
+              addDebugLog('LiveWS:SetupComplete', `Gemini Live session ready for turns (${formattedModel})`);
+              console.log("[LiveWS] setupComplete received");
+              liveWsReadyRef.current = true;
+              if (!setupResolved) {
+                setupResolved = true;
+                liveWsConnectPromiseRef.current = null;
+                resolve(ws);
+              }
+              return;
+            }
+
+            if (parsed.serverContent) {
+              // Interruption
+              if (parsed.serverContent.interrupted) {
+                addDebugLog('LiveWS:Interrupted', 'Sierra audio was interrupted by user');
+                console.log("[LiveWS] Interrupted by user");
+                stopPlayback();
+                return;
+              }
+
+              // Output Audio Transcription (text display in chat)
+              if (parsed.serverContent.outputTranscription?.text) {
+                liveWsTextAccumulatedRef.current += parsed.serverContent.outputTranscription.text;
+                const currentSierraId = liveWsCurrentSierraIdRef.current;
+                if (currentSierraId) {
+                  setTranscripts(prev => prev.map(item => item.id === currentSierraId ? {
+                    ...item,
+                    text: liveWsTextAccumulatedRef.current
+                  } : item));
+                }
+              }
+
+              // Model Turn Parts (text and PCM16 24kHz audio)
+              const parts = parsed.serverContent.modelTurn?.parts;
+              if (Array.isArray(parts)) {
+                for (const part of parts) {
+                  if (part?.text) {
+                    liveWsTextAccumulatedRef.current += part.text;
+                    const currentSierraId = liveWsCurrentSierraIdRef.current;
+                    if (currentSierraId) {
+                      setTranscripts(prev => prev.map(item => item.id === currentSierraId ? {
+                        ...item,
+                        text: liveWsTextAccumulatedRef.current
+                      } : item));
+                    }
+                  }
+                  if (part?.inlineData?.data) {
+                    liveWsAudioReceivedRef.current = true;
+                    // Play gaplessly via Web Audio AudioContext + AudioBufferSource scheduling
+                    playAudio(part.inlineData.data);
+                  }
+                }
+              }
+
+              // Turn complete
+              if (parsed.serverContent.turnComplete) {
+                const hadAudio = liveWsAudioReceivedRef.current;
+                const textReply = liveWsTextAccumulatedRef.current.trim();
+                addDebugLog('LiveWS:TurnComplete', `Turn complete (audio: ${hadAudio}, text chars: ${textReply.length})`);
+                console.log("[LiveWS] Turn complete");
+                isRespondingRef.current = false;
+
+                if (textReply) {
+                  persistVoiceMessage('sierra', textReply);
+                }
+
+                if (!hadAudio && textReply) {
+                  // Fallback to native TTS only when no audio came back
+                  addDebugLog('LiveWS:FallbackTTS', 'No audio stream returned; playing native TTS fallback');
+                  console.log("[LiveWS] Triggering native TTS fallback for response text");
+                  playTextToSpeech(textReply);
+                } else if (!hadAudio && !textReply) {
+                  if (isActiveRef.current && mode === 'continuous') {
+                    isPausedRef.current = false;
+                    setIsPaused(false);
+                    scheduleListeningRestart(PLAYBACK_COOLDOWN_MS);
+                  }
+                }
+              }
+              return;
+            }
+
+            if (parsed.error) {
+              const errMsg = parsed.error.message || JSON.stringify(parsed.error);
+              addDebugLog('LiveWS:Error', `Live server error: ${errMsg}`);
+              console.error("[LiveWS] Server error:", errMsg);
+              isRespondingRef.current = false;
+              toast.error(`Gemini Live: ${errMsg}`);
+              setConnectionError(`Gemini Live: ${errMsg}`);
+            }
+          } catch (parseErr: any) {
+            console.warn("[LiveWS] Message parse exception:", parseErr);
+          }
+        };
+
+        ws.onerror = (err: any) => {
+          const errMsg = err?.message || 'WebSocket network error';
+          addDebugLog('LiveWS:Error', errMsg);
+          console.error("[LiveWS] WebSocket error:", err);
+          isRespondingRef.current = false;
+          if (!setupResolved) {
+            setupResolved = true;
+            liveWsConnectPromiseRef.current = null;
+            reject(new Error(errMsg));
+          }
+        };
+
+        ws.onclose = (event: any) => {
+          const code = event.code;
+          const reason = event.reason || '';
+          addDebugLog('LiveWS:Close', `WebSocket closed (code: ${code}, reason: "${reason}")`);
+          console.warn(`[LiveWS:Close] Code ${code}: ${reason}`);
+          liveWsRef.current = null;
+          liveWsReadyRef.current = false;
+          liveWsConnectPromiseRef.current = null;
+          isRespondingRef.current = false; // Never leave isResponding stuck true
+
+          let userMsg = `Gemini Live connection closed (code ${code}${reason ? `: ${reason}` : ''})`;
+          if (code === 1007) {
+            userMsg = `Gemini Live rejected configuration (code 1007${reason ? `: ${reason}` : ''}). Live models require AUDIO response modalities.`;
+          }
+          setConnectionError(userMsg);
+          toast.error(userMsg);
+
+          const currentSierraId = liveWsCurrentSierraIdRef.current;
+          if (currentSierraId && !liveWsTextAccumulatedRef.current.trim() && !liveWsAudioReceivedRef.current) {
+            setTranscripts(prev => prev.map(item => item.id === currentSierraId ? {
+              ...item,
+              text: `[${userMsg}]`
+            } : item));
+          }
+
+          if (!setupResolved) {
+            setupResolved = true;
+            reject(new Error(userMsg));
+          }
+
+          // Resume listening if active in continuous mode so recognition is never stranded
+          if (isActiveRef.current && mode === 'continuous') {
+            isPausedRef.current = false;
+            setIsPaused(false);
+            scheduleListeningRestart(PLAYBACK_COOLDOWN_MS);
+          }
+        };
+      } catch (err: any) {
+        liveWsConnectPromiseRef.current = null;
+        reject(err);
+      }
+    });
+
+    liveWsConnectPromiseRef.current = connectPromise;
+    return await connectPromise;
+  };
+
   const handleUserUtterance = async (userText: string) => {
     addDebugLog('handleUserUtterance', `captured: "${userText}" (isResponding=${isRespondingRef.current})`);
     console.log("[Voice:Handoff] handleUserUtterance triggered with text:", userText);
@@ -709,17 +966,61 @@ export default function LiveVoice() {
     let accumulatedText = '';
 
     // Stop and fully release STT while model is thinking/speaking to avoid picking up speaker output
-    console.log("[Voice:handleUserUtterance] Stopping and releasing STT before streamChat");
+    console.log("[Voice:handleUserUtterance] Stopping and releasing STT before sending response");
     await stopSpeechToText();
 
+    const effectiveModel = customVoiceModel.trim() || voiceModel || 'gemini-3.8-live';
+
+    // Live WebSocket branch: Reuses one WebSocket session across utterances with responseModalities: ["AUDIO"]
+    if (isGeminiLiveModel(effectiveModel)) {
+      addDebugLog('LiveWS:SendTurn', `Sending user utterance to reused WebSocket session: "${userText}"`);
+      console.log("[LiveWS] Sending user turn over reused WebSocket session:", userText);
+
+      liveWsCurrentSierraIdRef.current = sierraId;
+      liveWsTextAccumulatedRef.current = '';
+      liveWsAudioReceivedRef.current = false;
+
+      try {
+        const ws = await ensureLiveWebSocket(effectiveModel);
+        const clientContentMessage = {
+          clientContent: {
+            turns: [
+              {
+                role: "user",
+                parts: [{ text: userText }],
+              },
+            ],
+            turnComplete: true,
+          },
+        };
+        ws.send(JSON.stringify(clientContentMessage));
+      } catch (wsErr: any) {
+        addDebugLog('LiveWS:SendError', wsErr.message || String(wsErr));
+        console.error("[LiveWS] Failed to send turn:", wsErr);
+        isRespondingRef.current = false;
+        const errMsg = wsErr.message || "Failed to connect to Gemini Live";
+        toast.error(errMsg);
+        setConnectionError(errMsg);
+        setTranscripts(prev => prev.map(item => item.id === sierraId ? {
+          ...item,
+          text: `[Error: ${errMsg}]`
+        } : item));
+        if (isActiveRef.current && mode === 'continuous') {
+          isPausedRef.current = false;
+          setIsPaused(false);
+          scheduleListeningRestart(PLAYBACK_COOLDOWN_MS);
+        }
+      }
+      return;
+    }
+
+    // Standard Non-Live branch (REST streamChat fallback)
     try {
       const history = transcriptsRef.current.slice(-6).map(t => ({
         role: t.sender === 'user' ? 'user' : 'model',
         content: t.text,
       }));
 
-      // 3. Send captured transcript to native direct Gemini streamChat
-      const effectiveModel = customVoiceModel.trim() || voiceModel || 'gemini-3.8-live';
       addDebugLog('streamChat', `called with model: "${effectiveModel}", prompt: "${userText}"`);
       console.log(`[Voice:streamChat] Initiating direct streamChat call with model ${effectiveModel}, prompt:`, userText);
       await streamChat({
@@ -736,7 +1037,6 @@ export default function LiveVoice() {
             addDebugLog('streamChat:Chunk', `First chunk received (${chunk.length} chars)`);
           }
           console.log("[Voice:streamChat:Chunk] Chunk received length:", chunk.length);
-          // Render streamed response into transcript UI
           setTranscripts(prev => prev.map(item => item.id === sierraId ? { ...item, text: accumulatedText } : item));
         },
         onDone: async () => {
@@ -745,7 +1045,6 @@ export default function LiveVoice() {
           isRespondingRef.current = false;
           if (accumulatedText.trim()) {
             persistVoiceMessage('sierra', accumulatedText.trim());
-            // 4. Trigger Text-to-Speech playback for the response (releases STT and enforces cooldown)
             console.log("[Voice:playTextToSpeech] Triggering TTS for model response");
             await playTextToSpeech(accumulatedText.trim());
           } else {
@@ -766,9 +1065,7 @@ export default function LiveVoice() {
           isRespondingRef.current = false;
           console.error("[Voice:streamChat:Error] Stream chat error occurred:", err);
           toast.error(`Voice error: ${err.message}`);
-          const displayErr = isGeminiLiveModel(effectiveModel)
-            ? `[Error: ${err.message}. Live models require Live WebSocket mode with a valid Gemini API key.]`
-            : `[Error: ${err.message}]`;
+          const displayErr = `[Error: ${err.message}]`;
           setTranscripts(prev => prev.map(item => item.id === sierraId ? {
             ...item,
             text: item.text.trim() ? `${item.text}\n\n${displayErr}` : displayErr
@@ -785,10 +1082,7 @@ export default function LiveVoice() {
       isRespondingRef.current = false;
       console.error("[Voice:streamChat:Catch] Failed to generate voice response:", err);
       toast.error(`Failed to generate voice response: ${err.message}`);
-      const effectiveModel = customVoiceModel.trim() || voiceModel || 'gemini-3.8-live';
-      const displayErr = isGeminiLiveModel(effectiveModel)
-        ? `[Error: ${err.message}. Live models require Live WebSocket mode with a valid Gemini API key.]`
-        : `[Error: ${err.message}]`;
+      const displayErr = `[Error: ${err.message}]`;
       setTranscripts(prev => prev.map(item => item.id === sierraId ? {
         ...item,
         text: item.text.trim() ? `${item.text}\n\n${displayErr}` : displayErr
@@ -883,6 +1177,21 @@ export default function LiveVoice() {
         // ignore
       }
       sessionRef.current = null;
+    }
+
+    if (liveWsRef.current) {
+      try {
+        liveWsRef.current.onopen = null;
+        liveWsRef.current.onmessage = null;
+        liveWsRef.current.onerror = null;
+        liveWsRef.current.onclose = null;
+        liveWsRef.current.close(1000, "Session stopped by user");
+      } catch (e) {
+        // ignore
+      }
+      liveWsRef.current = null;
+      liveWsReadyRef.current = false;
+      liveWsConnectPromiseRef.current = null;
     }
 
     stopAudioCapture();
@@ -1081,11 +1390,10 @@ export default function LiveVoice() {
             }
 
             // Item B: Startup failure check
-            // An errorCode 7 that arrives before "started", or within about 1 second of "ready", is a startup failure
-            const reachedStarted = hasReachedStartedRef.current;
+            // An errorCode 7 only counts as a startup failure when timeSinceReady <= 1200ms (remove !reachedStarted)
             const timeSinceReady = sessionReadyTimeRef.current > 0 ? (now - sessionReadyTimeRef.current) : 999999;
             const isErrorCode7 = errorCode === 7 || (typeof data?.error === 'string' && data.error.toLowerCase().includes('no match'));
-            const isStartupFailure = isErrorCode7 && (!reachedStarted || timeSinceReady <= 1200);
+            const isStartupFailure = isErrorCode7 && (timeSinceReady <= 1200);
 
             if (isStartupFailure) {
               startupFailuresRef.current++;
@@ -1125,6 +1433,11 @@ export default function LiveVoice() {
               startupFailuresRef.current = 0;
               consecutiveFailuresRef.current = 0;
               commitCurrentUtterance(currentSession);
+            } else if (isErrorCode7) {
+              // Silence timeout from normal listening (>1200ms): restart immediately without counting a failure, with no limit while Live tab is active
+              addDebugLog('STT:Silence', `[Session #${currentSession}] Normal silence timeout (code 7 after ${timeSinceReady}ms), restarting without failure count...`);
+              console.log(`[Native STT:Session#${currentSession}] Normal silence timeout (code 7), restarting listening immediately...`);
+              scheduleListeningRestart(300);
             } else {
               handleSilenceOrEmpty(currentSession);
             }

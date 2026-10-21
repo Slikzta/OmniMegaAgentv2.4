@@ -502,6 +502,10 @@ test("Live Voice Model Test-Connection & BidiGenerateContent WebSocket Pipeline"
     assert.deepStrictEqual(sentPayload, {
       setup: {
         model: "models/gemini-3.8-live",
+        generationConfig: {
+          responseModalities: ["AUDIO"],
+        },
+        outputAudioTranscription: {},
       },
     });
 
@@ -515,6 +519,10 @@ test("Live Voice Model Test-Connection & BidiGenerateContent WebSocket Pipeline"
     assert.deepStrictEqual(sentPayload, {
       setup: {
         model: "models/gemini-3.8-live-extended-thinking",
+        generationConfig: {
+          responseModalities: ["AUDIO"],
+        },
+        outputAudioTranscription: {},
       },
     });
   } finally {
@@ -690,7 +698,8 @@ test("Recognition Session Lifecycle: Startup Failures Not Counted as Empty Cycle
   // Verify startupFailuresRef and startup failure logic in source code
   assert.ok(liveVoiceCode.includes("startupFailuresRef = useRef<number>(0)"), "Must declare startupFailuresRef");
   assert.ok(liveVoiceCode.includes("isStartupFailure"), "Must identify isStartupFailure");
-  assert.ok(liveVoiceCode.includes("sessionDuration >= 3000"), "Empty cycles must require >= 3 seconds with started status");
+  assert.ok(!liveVoiceCode.includes("!reachedStarted || timeSinceReady <= 1200"), "Must remove !reachedStarted from isStartupFailure");
+  assert.ok(liveVoiceCode.includes("timeSinceReady <= 1200"), "Startup failure must only check timeSinceReady <= 1200");
   assert.ok(liveVoiceCode.includes("Speech recognizer failed to start after 3 attempts"), "Must display clear message after 3 startup failures");
 
   // Simulate startup failure vs empty cycle state machine
@@ -706,7 +715,7 @@ test("Recognition Session Lifecycle: Startup Failures Not Counted as Empty Cycle
     timeSinceReadyMs: number;
   }) => {
     const isErrorCode7 = params.errorCode === 7;
-    const isStartupFailure = isErrorCode7 && (!params.reachedStarted || params.timeSinceReadyMs <= 1200);
+    const isStartupFailure = isErrorCode7 && (params.timeSinceReadyMs <= 1200);
 
     if (isStartupFailure) {
       startupFailures++;
@@ -715,6 +724,11 @@ test("Recognition Session Lifecycle: Startup Failures Not Counted as Empty Cycle
         pauseReason = "Speech recognizer failed to start after 3 attempts. Tap mic to retry.";
       }
       return { type: "startup_failure", backoff: startupFailures === 1 ? 1000 : startupFailures === 2 ? 2000 : 4000 };
+    }
+
+    if (isErrorCode7) {
+      // After > 1200ms: normal silence timeout, restart immediately without counting a failure
+      return { type: "silence_restart", delayMs: 300 };
     }
 
     if (params.reachedStarted && params.durationMs >= 3000) {
@@ -729,7 +743,7 @@ test("Recognition Session Lifecycle: Startup Failures Not Counted as Empty Cycle
     return { type: "sub_3s_cycle" };
   };
 
-  // Immediate error code 7 with no 'started' event (or within 4ms of start) is a startup failure
+  // Immediate error code 7 within 1200ms of ready is a startup failure
   const sf1 = handleStoppedEvent({ errorCode: 7, reachedStarted: false, durationMs: 4, timeSinceReadyMs: 4 });
   assert.strictEqual(sf1.type, "startup_failure");
   assert.strictEqual(sf1.backoff, 1000);
@@ -748,6 +762,15 @@ test("Recognition Session Lifecycle: Startup Failures Not Counted as Empty Cycle
   assert.strictEqual(consecutiveFailures, 0);
   assert.strictEqual(isPaused, true);
   assert.strictEqual(pauseReason, "Speech recognizer failed to start after 3 attempts. Tap mic to retry.");
+
+  // Error code 7 arriving after > 1200ms (e.g. 5000ms silence timeout) is silence, NOT a startup failure
+  startupFailures = 0;
+  isPaused = false;
+  const silenceResult = handleStoppedEvent({ errorCode: 7, reachedStarted: false, durationMs: 5000, timeSinceReadyMs: 5000 });
+  assert.strictEqual(silenceResult.type, "silence_restart");
+  assert.strictEqual(startupFailures, 0, "Silence after 5s must NOT increment startup failures");
+  assert.strictEqual(consecutiveFailures, 0, "Silence after 5s must NOT increment empty cycles");
+  assert.strictEqual(isPaused, false, "Must NOT pause continuous listening on normal silence timeout");
 
   // A genuine empty cycle that reached 'started' and ran 3.5s without speech
   startupFailures = 0;
@@ -846,5 +869,31 @@ test("Recognition Session Lifecycle: No Start After Pause & Cancellation Checkpo
   currentSessionId = 6;
   assert.strictEqual(checkCancelled(5), true, "Must abort start sequence if superseded by newer session id");
 });
+
+test("Gemini Live WebSocket: Setup Configuration and responseModalities Contract", async () => {
+  const fs = await import("node:fs");
+  const liveVoiceCode = fs.readFileSync("src/components/LiveVoice.tsx", "utf-8");
+  const geminiCode = fs.readFileSync("src/lib/gemini.ts", "utf-8");
+
+  // 1. responseModalities MUST be ["AUDIO"], never TEXT
+  assert.ok(geminiCode.includes('responseModalities: ["AUDIO"]'), "gemini.ts must set responseModalities to ['AUDIO']");
+  assert.ok(!geminiCode.includes('responseModalities: ["TEXT"]'), "gemini.ts must NEVER set responseModalities to TEXT");
+  assert.ok(liveVoiceCode.includes('responseModalities: ["AUDIO"]'), "LiveVoice.tsx must set responseModalities to ['AUDIO']");
+  assert.ok(!liveVoiceCode.includes('responseModalities: ["TEXT"]'), "LiveVoice.tsx must NEVER set responseModalities to TEXT");
+
+  // 2. outputAudioTranscription MUST be enabled in setup
+  assert.ok(geminiCode.includes("outputAudioTranscription: {}"), "gemini.ts must enable outputAudioTranscription: {}");
+  assert.ok(liveVoiceCode.includes("outputAudioTranscription: {}"), "LiveVoice.tsx must enable outputAudioTranscription: {}");
+
+  // 3. Audio handling and playback via Web Audio playAudio
+  assert.ok(liveVoiceCode.includes("playAudio(part.inlineData.data)"), "LiveVoice.tsx must play inlineData audio via playAudio");
+  assert.ok(liveVoiceCode.includes("outputTranscription?.text"), "LiveVoice.tsx must capture outputTranscription text for chat UI");
+  assert.ok(liveVoiceCode.includes("serverContent.interrupted"), "LiveVoice.tsx must stop playback on interrupted");
+
+  // 4. WebSocket session reuse: single open WebSocket reused across turns
+  assert.ok(liveVoiceCode.includes("ensureLiveWebSocket"), "LiveVoice.tsx must define ensureLiveWebSocket for session reuse");
+  assert.ok(liveVoiceCode.includes("clientContentMessage"), "LiveVoice.tsx must send user turns via clientContent");
+});
+
 
 

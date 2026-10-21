@@ -28,7 +28,7 @@ const STORAGE_KEY_CONFIG = 'omni_providers_config';
 const STORAGE_KEY_ACTIVE = 'omni_active_provider';
 const STORAGE_KEY_KEYS = 'omni_provider_keys';
 
-function getNativeStoredKeys(): Record<string, string> {
+export function getNativeStoredKeys(): Record<string, string> {
   const result: Record<string, string> = {};
   try {
     if (typeof localStorage !== 'undefined') {
