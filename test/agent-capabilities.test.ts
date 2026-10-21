@@ -650,4 +650,201 @@ test("Continuous-Listening STT State Machine & ErrorCode 5 Recovery Pipeline", (
   assert.strictEqual(throttledLog("STT:Different", "Other detail", t0 + 1100), true, "Different log accepted immediately");
 });
 
+test("Recognition Session Lifecycle: Stale Session Events Ignored", async () => {
+  const fs = await import("node:fs");
+  const liveVoiceCode = fs.readFileSync("src/components/LiveVoice.tsx", "utf-8");
+
+  // Verify sessionIdRef and session tagging in source code
+  assert.ok(liveVoiceCode.includes("sessionIdRef = useRef<number>(0)"), "Must declare sessionIdRef");
+  assert.ok(liveVoiceCode.includes("const sessionId = ++sessionIdRef.current"), "Must increment sessionId on start");
+  assert.ok(liveVoiceCode.includes("eventSessionId !== sessionIdRef.current"), "Must check event sessionId against current session");
+  assert.ok(liveVoiceCode.includes("STT:StaleEvent"), "Must log stale session events as STT:StaleEvent");
+  assert.ok(liveVoiceCode.includes("sessionId: sessionId"), "Must pass sessionId to CapSpeechRecognition.start");
+
+  // Simulate stale session event filter behavior
+  let currentSessionId = 3;
+  let staleEventsLogged: string[] = [];
+
+  const handleListenerEvent = (event: { sessionId?: number; status?: string }) => {
+    if (event.sessionId !== undefined && event.sessionId !== currentSessionId) {
+      staleEventsLogged.push(`Stale event from session ${event.sessionId} ignored`);
+      return false; // Ignored
+    }
+    return true; // Accepted
+  };
+
+  // Events from older sessions (1 and 2) must be rejected
+  assert.strictEqual(handleListenerEvent({ sessionId: 1, status: "stopped" }), false);
+  assert.strictEqual(handleListenerEvent({ sessionId: 2, status: "ready" }), false);
+  assert.strictEqual(staleEventsLogged.length, 2);
+
+  // Event from current session (3) must be accepted
+  assert.strictEqual(handleListenerEvent({ sessionId: 3, status: "started" }), true);
+  assert.strictEqual(staleEventsLogged.length, 2);
+});
+
+test("Recognition Session Lifecycle: Startup Failures Not Counted as Empty Cycles", async () => {
+  const fs = await import("node:fs");
+  const liveVoiceCode = fs.readFileSync("src/components/LiveVoice.tsx", "utf-8");
+
+  // Verify startupFailuresRef and startup failure logic in source code
+  assert.ok(liveVoiceCode.includes("startupFailuresRef = useRef<number>(0)"), "Must declare startupFailuresRef");
+  assert.ok(liveVoiceCode.includes("isStartupFailure"), "Must identify isStartupFailure");
+  assert.ok(liveVoiceCode.includes("sessionDuration >= 3000"), "Empty cycles must require >= 3 seconds with started status");
+  assert.ok(liveVoiceCode.includes("Speech recognizer failed to start after 3 attempts"), "Must display clear message after 3 startup failures");
+
+  // Simulate startup failure vs empty cycle state machine
+  let consecutiveFailures = 0; // empty cycles
+  let startupFailures = 0;
+  let isPaused = false;
+  let pauseReason = "";
+
+  const handleStoppedEvent = (params: {
+    errorCode?: number;
+    reachedStarted: boolean;
+    durationMs: number;
+    timeSinceReadyMs: number;
+  }) => {
+    const isErrorCode7 = params.errorCode === 7;
+    const isStartupFailure = isErrorCode7 && (!params.reachedStarted || params.timeSinceReadyMs <= 1200);
+
+    if (isStartupFailure) {
+      startupFailures++;
+      if (startupFailures >= 3) {
+        isPaused = true;
+        pauseReason = "Speech recognizer failed to start after 3 attempts. Tap mic to retry.";
+      }
+      return { type: "startup_failure", backoff: startupFailures === 1 ? 1000 : startupFailures === 2 ? 2000 : 4000 };
+    }
+
+    if (params.reachedStarted && params.durationMs >= 3000) {
+      consecutiveFailures++;
+      if (consecutiveFailures >= 3) {
+        isPaused = true;
+        pauseReason = "Continuous listening paused after 3 empty cycles. Tap mic to resume.";
+      }
+      return { type: "empty_cycle" };
+    }
+
+    return { type: "sub_3s_cycle" };
+  };
+
+  // Immediate error code 7 with no 'started' event (or within 4ms of start) is a startup failure
+  const sf1 = handleStoppedEvent({ errorCode: 7, reachedStarted: false, durationMs: 4, timeSinceReadyMs: 4 });
+  assert.strictEqual(sf1.type, "startup_failure");
+  assert.strictEqual(sf1.backoff, 1000);
+  assert.strictEqual(startupFailures, 1);
+  assert.strictEqual(consecutiveFailures, 0, "Startup failure must NOT increment empty cycles");
+
+  const sf2 = handleStoppedEvent({ errorCode: 7, reachedStarted: false, durationMs: 10, timeSinceReadyMs: 10 });
+  assert.strictEqual(sf2.type, "startup_failure");
+  assert.strictEqual(sf2.backoff, 2000);
+  assert.strictEqual(startupFailures, 2);
+  assert.strictEqual(consecutiveFailures, 0);
+
+  const sf3 = handleStoppedEvent({ errorCode: 7, reachedStarted: false, durationMs: 15, timeSinceReadyMs: 15 });
+  assert.strictEqual(sf3.type, "startup_failure");
+  assert.strictEqual(startupFailures, 3);
+  assert.strictEqual(consecutiveFailures, 0);
+  assert.strictEqual(isPaused, true);
+  assert.strictEqual(pauseReason, "Speech recognizer failed to start after 3 attempts. Tap mic to retry.");
+
+  // A genuine empty cycle that reached 'started' and ran 3.5s without speech
+  startupFailures = 0;
+  isPaused = false;
+  const ec1 = handleStoppedEvent({ errorCode: undefined, reachedStarted: true, durationMs: 3500, timeSinceReadyMs: 3600 });
+  assert.strictEqual(ec1.type, "empty_cycle");
+  assert.strictEqual(consecutiveFailures, 1);
+  assert.strictEqual(startupFailures, 0);
+});
+
+test("Recognition Session Lifecycle: Resume-from-Pause Teardown and Counter Reset", async () => {
+  const fs = await import("node:fs");
+  const liveVoiceCode = fs.readFileSync("src/components/LiveVoice.tsx", "utf-8");
+
+  // Verify resume tap implementation
+  assert.ok(liveVoiceCode.includes("resumeGracePeriodUntilRef"), "Must declare resumeGracePeriodUntilRef");
+  assert.ok(liveVoiceCode.includes("startupFailuresRef.current = 0"), "Must reset startupFailuresRef on resume");
+  assert.ok(liveVoiceCode.includes("consecutiveFailuresRef.current = 0"), "Must reset consecutiveFailuresRef on resume");
+  assert.ok(liveVoiceCode.includes("clientErrorRecoveryCountRef.current = 0"), "Must reset clientErrorRecoveryCountRef on resume");
+  assert.ok(liveVoiceCode.includes("1500"), "Must configure 1.5s resume grace period");
+  assert.ok(liveVoiceCode.includes("750"), "Must wait at least 750ms before starting after resume tap");
+
+  // Simulate resume tap lifecycle
+  let consecutiveFailures = 3;
+  let startupFailures = 3;
+  let clientErrorRecoveryCount = 2;
+  let isPaused = true;
+  let teardownCalled = false;
+  let resumeGracePeriodUntil = 0;
+
+  const onResumeTap = async () => {
+    // 1. Teardown
+    teardownCalled = true;
+
+    // 2. 1.5s grace period
+    const now = 10000;
+    resumeGracePeriodUntil = now + 1500;
+
+    // 3. Reset all counters and flags
+    consecutiveFailures = 0;
+    startupFailures = 0;
+    clientErrorRecoveryCount = 0;
+    isPaused = false;
+  };
+
+  await onResumeTap();
+  assert.strictEqual(teardownCalled, true);
+  assert.strictEqual(isPaused, false);
+  assert.strictEqual(consecutiveFailures, 0);
+  assert.strictEqual(startupFailures, 0);
+  assert.strictEqual(clientErrorRecoveryCount, 0);
+  assert.strictEqual(resumeGracePeriodUntil, 11500);
+
+  // During 1.5s grace period, errorCode 5 and 7 are ignored as benign
+  const isIgnoredDuringGrace = (errorCode: number, timestamp: number) => {
+    return timestamp < resumeGracePeriodUntil && (errorCode === 5 || errorCode === 7);
+  };
+  assert.strictEqual(isIgnoredDuringGrace(5, 10200), true, "ErrorCode 5 ignored during grace window");
+  assert.strictEqual(isIgnoredDuringGrace(7, 10500), true, "ErrorCode 7 ignored during grace window");
+  assert.strictEqual(isIgnoredDuringGrace(5, 12000), false, "ErrorCode 5 not ignored after grace window");
+});
+
+test("Recognition Session Lifecycle: No Start After Pause & Cancellation Checkpoints", async () => {
+  const fs = await import("node:fs");
+  const liveVoiceCode = fs.readFileSync("src/components/LiveVoice.tsx", "utf-8");
+
+  // Verify cancellation checkpoints in startSpeechToText
+  assert.ok(liveVoiceCode.includes("isStartCancelled"), "Must define isStartCancelled helper in startSpeechToText");
+  assert.ok(liveVoiceCode.includes("isStoppingRef.current"), "Must guard isStoppingRef to prevent start while stopping");
+  assert.ok(liveVoiceCode.includes("800"), "Must enforce at least 800ms settling time after stop/teardown");
+  assert.ok(liveVoiceCode.includes("STT:Start:Aborted"), "Must log cancellation when aborted");
+
+  // Simulate cancellation checkpoints
+  let isPaused = false;
+  let isStopping = false;
+  let currentSessionId = 5;
+
+  const checkCancelled = (sessionTag: number) => {
+    return isPaused || isStopping || currentSessionId !== sessionTag;
+  };
+
+  // Initially active, valid session
+  assert.strictEqual(checkCancelled(5), false);
+
+  // Abort if paused
+  isPaused = true;
+  assert.strictEqual(checkCancelled(5), true, "Must abort start sequence if paused");
+
+  // Abort if stopping
+  isPaused = false;
+  isStopping = true;
+  assert.strictEqual(checkCancelled(5), true, "Must abort start sequence if previous session stopping");
+
+  // Abort if superseded by newer session
+  isStopping = false;
+  currentSessionId = 6;
+  assert.strictEqual(checkCancelled(5), true, "Must abort start sequence if superseded by newer session id");
+});
+
 

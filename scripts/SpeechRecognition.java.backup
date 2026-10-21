@@ -183,22 +183,28 @@ public class SpeechRecognition extends Plugin implements Constants {
                     try {
                         SpeechRecognition.this.lock.lock();
 
-                        // Cancel previous active listening without destroying the SpeechRecognizer binder IPC connection
+                        // Destroy previous recognizer if it exists before creating a new one
                         if (speechRecognizer != null) {
                             try {
+                                speechRecognizer.stopListening();
+                            } catch (Exception ignore) {}
+                            try {
                                 speechRecognizer.cancel();
-                            } catch (Exception cancelEx) {
-                                Logger.warn(getLogTag(), "Error canceling previous recognizer session: " + cancelEx.getMessage());
-                            }
-                        } else {
-                            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(bridge.getActivity());
+                            } catch (Exception ignore) {}
+                            try {
+                                speechRecognizer.destroy();
+                            } catch (Exception ignore) {}
+                            speechRecognizer = null;
                         }
+                        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(bridge.getActivity());
 
                         previousPartialResults = new JSONArray();
 
                         SpeechRecognitionListener listener = new SpeechRecognitionListener();
                         listener.setCall(call);
                         listener.setPartialResults(partialResults);
+                        int sessionId = call.getInt("sessionId", 0);
+                        listener.setSessionId(sessionId);
                         speechRecognizer.setRecognitionListener(listener);
 
                         try {
@@ -239,6 +245,13 @@ public class SpeechRecognition extends Plugin implements Constants {
                         } catch (Exception ex) {
                             Logger.warn(getLogTag(), "Error in stopListening: " + ex.getMessage());
                         }
+                        try {
+                            speechRecognizer.cancel();
+                        } catch (Exception ignore) {}
+                        try {
+                            speechRecognizer.destroy();
+                        } catch (Exception ignore) {}
+                        speechRecognizer = null;
                     }
                     SpeechRecognition.this.listening(false);
                 } finally {
@@ -251,6 +264,7 @@ public class SpeechRecognition extends Plugin implements Constants {
 
         private PluginCall call;
         private boolean partialResults;
+        private int sessionId = 0;
 
         public void setCall(PluginCall call) {
             this.call = call;
@@ -260,12 +274,17 @@ public class SpeechRecognition extends Plugin implements Constants {
             this.partialResults = partialResults;
         }
 
+        public void setSessionId(int sessionId) {
+            this.sessionId = sessionId;
+        }
+
         @Override
         public void onReadyForSpeech(Bundle params) {
             try {
                 SpeechRecognition.this.lock.lock();
                 JSObject ret = new JSObject();
                 ret.put("status", "ready");
+                ret.put("sessionId", this.sessionId);
                 SpeechRecognition.this.notifyListeners(LISTENING_EVENT, ret);
             } finally {
                 SpeechRecognition.this.lock.unlock();
@@ -279,6 +298,7 @@ public class SpeechRecognition extends Plugin implements Constants {
                 // Notify listeners that recording has started
                 JSObject ret = new JSObject();
                 ret.put("status", "started");
+                ret.put("sessionId", this.sessionId);
                 SpeechRecognition.this.notifyListeners(LISTENING_EVENT, ret);
             } finally {
                 SpeechRecognition.this.lock.unlock();
@@ -297,6 +317,7 @@ public class SpeechRecognition extends Plugin implements Constants {
                 SpeechRecognition.this.lock.lock();
                 JSObject ret = new JSObject();
                 ret.put("status", "endOfSpeech");
+                ret.put("sessionId", this.sessionId);
                 SpeechRecognition.this.notifyListeners(LISTENING_EVENT, ret);
             } finally {
                 SpeechRecognition.this.lock.unlock();
@@ -315,6 +336,7 @@ public class SpeechRecognition extends Plugin implements Constants {
                 ret.put("status", "stopped");
                 ret.put("error", errorMssg);
                 ret.put("errorCode", error);
+                ret.put("sessionId", this.sessionId);
                 SpeechRecognition.this.notifyListeners(LISTENING_EVENT, ret);
             } finally {
                 SpeechRecognition.this.lock.unlock();
@@ -342,12 +364,14 @@ public class SpeechRecognition extends Plugin implements Constants {
                 // Notify partialResults matches so JS buffer gets the final recognized utterance
                 JSObject retMatches = new JSObject();
                 retMatches.put("matches", jsArray);
+                retMatches.put("sessionId", this.sessionId);
                 SpeechRecognition.this.notifyListeners("partialResults", retMatches);
 
                 // Notify listeningState stopped with results
                 JSObject ret = new JSObject();
                 ret.put("status", "stopped");
                 ret.put("matches", jsArray);
+                ret.put("sessionId", this.sessionId);
                 SpeechRecognition.this.notifyListeners(LISTENING_EVENT, ret);
 
                 if (this.call != null && !this.partialResults) {
@@ -375,6 +399,7 @@ public class SpeechRecognition extends Plugin implements Constants {
                     previousPartialResults = matchesJSON;
                     JSObject ret = new JSObject();
                     ret.put("matches", previousPartialResults);
+                    ret.put("sessionId", this.sessionId);
                     notifyListeners("partialResults", ret);
                 }
             } catch (Exception ex) {}

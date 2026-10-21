@@ -8,19 +8,11 @@ const pluginDir = path.resolve(
 const pluginJavaPath = path.resolve(pluginDir, 'SpeechRecognition.java');
 const backupPath = path.resolve(__dirname, 'SpeechRecognition.java.backup');
 
-// If the target file is missing or outdated compared to backup, restore from backup
+// If the target file is missing or differs from backup, sync from backup
 if (fs.existsSync(backupPath)) {
-  if (!fs.existsSync(pluginJavaPath)) {
-    fs.mkdirSync(pluginDir, { recursive: true });
-    fs.copyFileSync(backupPath, pluginJavaPath);
-    console.log('[patch-speech-recognition] Restored SpeechRecognition.java from backup.');
-  } else {
-    const existing = fs.readFileSync(pluginJavaPath, 'utf8');
-    if (!existing.includes('status", "endOfSpeech')) {
-      fs.copyFileSync(backupPath, pluginJavaPath);
-      console.log('[patch-speech-recognition] Updated SpeechRecognition.java with full continuous listening patch from backup.');
-    }
-  }
+  fs.mkdirSync(pluginDir, { recursive: true });
+  fs.copyFileSync(backupPath, pluginJavaPath);
+  console.log('[patch-speech-recognition] Synchronized SpeechRecognition.java from backup.');
 }
 
 if (fs.existsSync(pluginJavaPath)) {
