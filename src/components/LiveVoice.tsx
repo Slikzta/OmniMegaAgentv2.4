@@ -9,7 +9,7 @@ import { collection, addDoc } from 'firebase/firestore';
 import { Button } from './ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { Input } from './ui/input';
-import { LIVE_VOICE_MODELS, DEFAULT_LIVE_WEBSOCKET_URL } from '../lib/gemini';
+import { LIVE_VOICE_MODELS, DEFAULT_LIVE_WEBSOCKET_URL, isGeminiLiveModel } from '../lib/gemini';
 import { 
   Mic, MicOff, Loader2, Sparkles, AlertCircle, RefreshCw, Volume2, MessageSquare,
   Copy, FileText, Trash2, Check, X, AlertTriangle
@@ -229,6 +229,9 @@ export default function LiveVoice() {
   const retryTimerRef = useRef<any>(null);
   const recognitionTimeoutRef = useRef<any>(null);
   const consecutiveFailuresRef = useRef<number>(0);
+  const lastCommitTimeRef = useRef<number>(0);
+  const lastEndOfSpeechTimeRef = useRef<number>(0);
+  const lastStopTimeRef = useRef<number>(0);
   const MAX_RECOGNITION_RETRIES = 3;
   const RECOGNITION_TIMEOUT_MS = 12000;
   const PLAYBACK_COOLDOWN_MS = 750;
@@ -412,6 +415,10 @@ export default function LiveVoice() {
         if (timer) clearTimeout(timer);
         setIsSpeaking(false);
         isSpeakingRef.current = false;
+        if (isActiveRef.current && mode === 'continuous') {
+          isPausedRef.current = false;
+          setIsPaused(false);
+        }
         scheduleListeningRestart();
       }
       return;
@@ -420,6 +427,8 @@ export default function LiveVoice() {
     // 2. Web browser fallback with SpeechSynthesis
     if (typeof window === 'undefined' || !window.speechSynthesis) {
       if (isActiveRef.current && mode === 'continuous') {
+        isPausedRef.current = false;
+        setIsPaused(false);
         scheduleListeningRestart(PLAYBACK_COOLDOWN_MS);
       }
       return;
@@ -456,6 +465,8 @@ export default function LiveVoice() {
         // Resume continuous listening ONLY after playback fully completes, with a short cooldown buffer
         // to avoid catching playback tail audio from the device speaker
         if (isActiveRef.current && mode === 'continuous') {
+          isPausedRef.current = false;
+          setIsPaused(false);
           scheduleListeningRestart(PLAYBACK_COOLDOWN_MS);
         }
       };
@@ -466,6 +477,8 @@ export default function LiveVoice() {
         setIsSpeaking(false);
         isSpeakingRef.current = false;
         if (isActiveRef.current && mode === 'continuous') {
+          isPausedRef.current = false;
+          setIsPaused(false);
           scheduleListeningRestart(PLAYBACK_COOLDOWN_MS);
         }
       };
@@ -517,8 +530,11 @@ export default function LiveVoice() {
 
     console.log(`[Native STT:FinalResult:Cycle#${currentId}] Complete user utterance captured:`, textToCommit);
     console.log(`[Native STT:Handoff:Cycle#${currentId}] Dispatching utterance to handleUserUtterance...`);
+    lastCommitTimeRef.current = Date.now();
     consecutiveFailuresRef.current = 0;
     clientErrorRecoveryCountRef.current = 0;
+    isPausedRef.current = false;
+    setIsPaused(false);
     await stopSpeechToText();
     await handleUserUtterance(textToCommit);
   };
@@ -673,7 +689,13 @@ export default function LiveVoice() {
             await playTextToSpeech(accumulatedText.trim());
           } else {
             console.log("[Voice:streamChat:Done] Response text was empty, resuming listening");
+            setTranscripts(prev => prev.map(item => item.id === sierraId ? {
+              ...item,
+              text: item.text.trim() || "[No response received]"
+            } : item));
             if (isActiveRef.current && mode === 'continuous') {
+              isPausedRef.current = false;
+              setIsPaused(false);
               scheduleListeningRestart(PLAYBACK_COOLDOWN_MS);
             }
           }
@@ -683,7 +705,16 @@ export default function LiveVoice() {
           isRespondingRef.current = false;
           console.error("[Voice:streamChat:Error] Stream chat error occurred:", err);
           toast.error(`Voice error: ${err.message}`);
+          const displayErr = isGeminiLiveModel(effectiveModel)
+            ? `[Error: ${err.message}. Live models require Live WebSocket mode with a valid Gemini API key.]`
+            : `[Error: ${err.message}]`;
+          setTranscripts(prev => prev.map(item => item.id === sierraId ? {
+            ...item,
+            text: item.text.trim() ? `${item.text}\n\n${displayErr}` : displayErr
+          } : item));
           if (isActiveRef.current && mode === 'continuous') {
+            isPausedRef.current = false;
+            setIsPaused(false);
             scheduleListeningRestart(PLAYBACK_COOLDOWN_MS);
           }
         }
@@ -693,7 +724,17 @@ export default function LiveVoice() {
       isRespondingRef.current = false;
       console.error("[Voice:streamChat:Catch] Failed to generate voice response:", err);
       toast.error(`Failed to generate voice response: ${err.message}`);
+      const effectiveModel = customVoiceModel.trim() || voiceModel || 'gemini-3.8-live';
+      const displayErr = isGeminiLiveModel(effectiveModel)
+        ? `[Error: ${err.message}. Live models require Live WebSocket mode with a valid Gemini API key.]`
+        : `[Error: ${err.message}]`;
+      setTranscripts(prev => prev.map(item => item.id === sierraId ? {
+        ...item,
+        text: item.text.trim() ? `${item.text}\n\n${displayErr}` : displayErr
+      } : item));
       if (isActiveRef.current && mode === 'continuous') {
+        isPausedRef.current = false;
+        setIsPaused(false);
         scheduleListeningRestart(PLAYBACK_COOLDOWN_MS);
       }
     }
@@ -876,6 +917,7 @@ export default function LiveVoice() {
             isNativeListeningRef.current = true;
             isStartingRef.current = false;
           } else if (data?.status === 'endOfSpeech') {
+            lastEndOfSpeechTimeRef.current = Date.now();
             addDebugLog('STT:EndOfSpeech', `[Cycle #${cycleId}] Speech pause detected, waiting for recognizer results...`);
           } else if (data?.status === 'stopped') {
             isNativeListeningRef.current = false;
@@ -883,6 +925,8 @@ export default function LiveVoice() {
 
             if (data?.matches && Array.isArray(data.matches) && data.matches.length > 0 && data.matches[0].trim()) {
               currentTranscriptRef.current = data.matches[0].trim();
+              consecutiveFailuresRef.current = 0;
+              clientErrorRecoveryCountRef.current = 0;
             }
 
             const errorCode = data?.errorCode;
@@ -893,8 +937,23 @@ export default function LiveVoice() {
               console.warn(`[Native STT:NativeError:Cycle#${cycleId}]`, data.error, errorCode);
             }
 
+            const now = Date.now();
+            const isRecentCommit = (now - lastCommitTimeRef.current) < 3500;
+            const isRecentEndOfSpeech = (now - lastEndOfSpeechTimeRef.current) < 3500;
+            const isRecentStop = (now - lastStopTimeRef.current) < 3500;
+            const isSpeakingOrResponding = isSpeakingRef.current || isRespondingRef.current;
+            const isBenignClientError = isClientError && (isRecentCommit || isRecentEndOfSpeech || isRecentStop || isSpeakingOrResponding);
+
+            // FIX 1: If errorCode 5 arrives right after an utterance was already committed,
+            // or right after a normal stop or endOfSpeech, ignore it. Do not count it as a failure and do not start recovery.
+            if (isBenignClientError) {
+              addDebugLog('STT:IgnoreClientError', `[Cycle #${cycleId}] Ignored benign errorCode 5 following utterance commit, stop, or reply playback`);
+              console.log(`[Native STT:Cycle#${cycleId}] Ignored benign errorCode 5 following utterance commit/stop/playback`);
+              return;
+            }
+
             // On errorCode 5: do NOT count it as an empty cycle. Fully stop and tear down the recognizer,
-            // wait 500-1000 ms, re-initialize it once, then start. Allow at most 2 such recoveries in a row,
+            // wait at least 500 ms, re-initialize it once, then start. Allow at most 2 such recoveries in a row,
             // then pause and surface a clear error ("Speech recognizer unavailable, tap mic to retry").
             if (isClientError && !currentTranscriptRef.current.trim()) {
               if (clientErrorRecoveryCountRef.current < 2) {
@@ -905,7 +964,7 @@ export default function LiveVoice() {
                 } catch (_) {}
                 await teardownNativeListeners();
                 await new Promise((resolve) => setTimeout(resolve, 750));
-                if (!isActiveRef.current || isPausedRef.current) return;
+                if (!isActiveRef.current || isPausedRef.current || isSpeakingRef.current || isRespondingRef.current) return;
                 await setupNativeListeners();
                 startSpeechToText();
                 return;
@@ -1101,6 +1160,19 @@ export default function LiveVoice() {
 
         const errMsg = String(nativeErr?.message || '');
         const isClientErr = errMsg.includes('5') || errMsg.toLowerCase().includes('client');
+
+        const now = Date.now();
+        const isRecentCommit = (now - lastCommitTimeRef.current) < 3500;
+        const isRecentEndOfSpeech = (now - lastEndOfSpeechTimeRef.current) < 3500;
+        const isRecentStop = (now - lastStopTimeRef.current) < 3500;
+        const isSpeakingOrResponding = isSpeakingRef.current || isRespondingRef.current;
+        const isBenignClientErr = isClientErr && (isRecentCommit || isRecentEndOfSpeech || isRecentStop || isSpeakingOrResponding);
+
+        if (isBenignClientErr) {
+          addDebugLog('STT:IgnoreClientError', `Ignored benign client error on start following recent commit/stop/playback`);
+          return;
+        }
+
         if (isClientErr) {
           if (clientErrorRecoveryCountRef.current < 2) {
             clientErrorRecoveryCountRef.current++;
@@ -1110,7 +1182,7 @@ export default function LiveVoice() {
             } catch (_) {}
             await teardownNativeListeners();
             await new Promise((resolve) => setTimeout(resolve, 750));
-            if (!isActiveRef.current || isPausedRef.current) return;
+            if (!isActiveRef.current || isPausedRef.current || isSpeakingRef.current || isRespondingRef.current) return;
             await setupNativeListeners();
             startSpeechToText();
             return;
@@ -1229,6 +1301,7 @@ export default function LiveVoice() {
   };
 
   const stopSpeechToText = async () => {
+    lastStopTimeRef.current = Date.now();
     console.log("[Native STT:Stop] stopSpeechToText called");
     if (silenceTimerRef.current) {
       clearTimeout(silenceTimerRef.current);

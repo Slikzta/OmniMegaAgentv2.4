@@ -1,5 +1,5 @@
 import { Capacitor } from '@capacitor/core';
-import { isGeminiLiveModel, testGeminiLiveWebSocket } from './gemini';
+import { isGeminiLiveModel, testGeminiLiveWebSocket, streamGeminiLiveWebSocket } from './gemini';
 
 export interface ProviderInfo {
   id: string;
@@ -425,6 +425,53 @@ export async function streamChat(
 ): Promise<() => void> {
   const controller = new AbortController();
 
+  const requestedModel = params.model || "gemini-3.5-flash-lite";
+
+  // FIX 2: Models whose name contains "live" (e.g. gemini-3.8-live) must never be sent through
+  // the REST generateContent/streamChat path. Route them through the existing Live API WebSocket
+  // (bidiGenerateContent) pipeline that the Test Connection feature already uses.
+  if (isGeminiLiveModel(requestedModel)) {
+    const keys = getNativeStoredKeys();
+    const effectiveKey = keys[params.provider || 'gemini'] || keys.gemini || (typeof process !== 'undefined' ? process.env?.GEMINI_API_KEY : '');
+    const customWsUrl = typeof localStorage !== 'undefined' ? localStorage.getItem('sierra_live_voice_endpoint') || undefined : undefined;
+
+    if (effectiveKey) {
+      let cancelLiveWs: (() => void) | null = null;
+      streamGeminiLiveWebSocket({
+        apiKey: effectiveKey,
+        model: requestedModel,
+        messages: params.messages.map(m => ({ role: m.role, content: m.content || '' })),
+        systemInstruction: params.systemInstruction,
+        liveWsUrl: customWsUrl,
+        callbacks: {
+          onChunk: callbacks.onChunk,
+          onMetadata: callbacks.onMetadata,
+          onDone: callbacks.onDone,
+          onError: (err) => {
+            callbacks.onError(err);
+          },
+        },
+      }).then(cancel => {
+        cancelLiveWs = cancel;
+      }).catch(err => {
+        callbacks.onError(err);
+      });
+
+      return () => {
+        if (cancelLiveWs) cancelLiveWs();
+        controller.abort();
+      };
+    } else {
+      // If no direct API key is available in client storage for live WebSocket,
+      // fallback to standard non-live text model for REST streamChat
+      console.warn(`[streamChat] Gemini Live model "${requestedModel}" requested without direct API key. Using standard text model gemini-2.5-flash for REST stream.`);
+      params = {
+        ...params,
+        model: "gemini-2.5-flash",
+      };
+    }
+  }
+
   // On native Capacitor, call Gemini API directly from client with saved key
   if (Capacitor.isNativePlatform()) {
     const keys = getNativeStoredKeys();
@@ -435,7 +482,7 @@ export async function streamChat(
       return () => controller.abort();
     }
 
-    const model = params.model || "gemini-3.5-flash-lite";
+    const model = (params.model && !isGeminiLiveModel(params.model)) ? params.model : "gemini-2.5-flash";
 
     // Format messages for Gemini API
     const contents = params.messages.map((m) => {

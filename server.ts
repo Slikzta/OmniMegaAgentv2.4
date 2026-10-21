@@ -432,8 +432,13 @@ async function startServer() {
           };
         });
 
+        const modelToUse = isGeminiLiveModel(effectiveModel) ? "gemini-2.5-flash" : (effectiveModel || "gemini-3-flash-preview");
+        if (isGeminiLiveModel(effectiveModel)) {
+          console.warn(`[API:Chat] Model "${effectiveModel}" is a Gemini Live model and cannot be called via REST generateContentStream. Falling back to "${modelToUse}".`);
+        }
+
         const responseStream = await ai.models.generateContentStream({
-          model: effectiveModel || "gemini-3-flash-preview",
+          model: modelToUse,
           contents,
           config: {
             systemInstruction: systemInstruction || undefined,
