@@ -1,0 +1,6 @@
+{
+  "name": "OmniAgent",
+  "description": "AI Voice and multi-provider agent with Gemini Live, continuous voice conversation, and intelligent tools.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
